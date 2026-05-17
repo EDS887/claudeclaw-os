@@ -1,4 +1,4 @@
-#!/usr/bin/env tsx
+#!/usr/bin/env npx tsx
 import crypto from 'crypto';
 import { execSync, spawnSync } from 'child_process';
 import fs from 'fs';
