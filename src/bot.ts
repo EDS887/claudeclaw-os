@@ -3,7 +3,7 @@ import path from 'path';
 import os from 'os';
 import { Api, Bot, Context, InputFile, RawApi } from 'grammy';
 
-import { runAgent, runAgentWithRetry, UsageInfo, AgentProgressEvent } from './agent.js';
+import { runAgent, runAgentWithRetry, UsageInfo, AgentProgressEvent, AgentToolPolicy } from './agent.js';
 import { AgentError } from './errors.js';
 import {
   AGENT_ID,
@@ -15,6 +15,7 @@ import {
   MAX_MESSAGE_LENGTH,
   activeBotToken,
   agentDefaultModel,
+  agentProvider,
   agentMcpAllowlist,
   agentSystemPrompt,
   TYPING_REFRESH_MS,
@@ -28,6 +29,7 @@ import {
   PROTECTED_ENV_VARS,
   DAILY_COST_BUDGET,
   HOURLY_TOKEN_BUDGET,
+  MEMORY_NOTIFY,
   PROJECT_ROOT,
 } from './config.js';
 import { clearSession, getRecentConversation, getRecentMemories, getRecentTaskOutputs, getSession, getSessionConversation, logToHiveMind, pinMemory, unpinMemory, setSession, lookupWaChatId, saveWaMessageMap, saveTokenUsage, saveCompactionEvent, getCompactionCount } from './db.js';
@@ -38,6 +40,7 @@ import { classifyMessageComplexity } from './message-classifier.js';
 import { scanForSecrets, redactSecrets } from './exfiltration-guard.js';
 import { trackUsage, getRateStatus } from './rate-tracker.js';
 import { buildCostFooter } from './cost-footer.js';
+import { DEFAULT_CLAUDE_MODEL, getMainProviderConfig, getProviderDisplay, ProviderConfig } from './provider.js';
 import { setHighImportanceCallback } from './memory-ingest.js';
 import { messageQueue } from './message-queue.js';
 import { parseDelegation, delegateToAgent, getAvailableAgents } from './orchestrator.js';
@@ -53,6 +56,21 @@ import {
   getSecurityStatus,
   audit,
 } from './security.js';
+
+// ── ACP tool policy for conversational chat turns ────────────────────
+// Telegram and dashboard chat are conversational by default. Claude has
+// months of demonstrated good judgment about when to run tools mid-chat,
+// so it keeps full access. ACP providers (codex/gemini/opencode) are new
+// to this path and have shown they'll happily interpret a casual message
+// as a coding task — codex once ran the full test suite on "hey, wake up,
+// time to solve the puzzle." Lock them to read-only by default; lift via
+// explicit per-turn escalation in a follow-up.
+const CHAT_ACP_TOOL_POLICY: AgentToolPolicy = { allowedTools: ['Read', 'Grep', 'Glob'] };
+
+function chatToolPolicyFor(provider: ProviderConfig | undefined): AgentToolPolicy | undefined {
+  if (!provider || provider.type === 'claude') return undefined;
+  return CHAT_ACP_TOOL_POLICY;
+}
 
 // ── Streaming rate limiter ───────────────────────────────────────────
 const globalStreamLastEdit = new Map<string, number>();
@@ -104,6 +122,21 @@ function checkContextWarning(chatId: string, sessionId: string | undefined, usag
   }
 
   return null;
+}
+
+function activeProvider(): ProviderConfig {
+  return agentProvider ?? getMainProviderConfig();
+}
+
+function canUseTelegramUrlButton(rawUrl: string): boolean {
+  try {
+    const url = new URL(rawUrl);
+    if (url.protocol !== 'http:' && url.protocol !== 'https:') return false;
+    const host = url.hostname.toLowerCase();
+    return host !== 'localhost' && host !== '127.0.0.1' && host !== '::1';
+  } catch {
+    return false;
+  }
 }
 import {
   downloadTelegramFile,
@@ -516,10 +549,13 @@ async function handleMessage(ctx: Context, message: string, forceVoiceReply = fa
   const fullMessage = parts.join('\n\n');
 
   // Smart model routing: use cheap model for simple acknowledgments
-  const userModel = chatModelOverride.get(chatIdStr) ?? agentDefaultModel;
-  const effectiveModel = (SMART_ROUTING_ENABLED && !userModel && classifyMessageComplexity(message) === 'simple')
+  const provider = activeProvider();
+  const userModel = provider.type === 'claude'
+    ? (chatModelOverride.get(chatIdStr) ?? agentDefaultModel ?? provider.model)
+    : undefined;
+  const effectiveModel = provider.type === 'claude' && SMART_ROUTING_ENABLED && !userModel && classifyMessageComplexity(message) === 'simple'
     ? SMART_ROUTING_CHEAP_MODEL
-    : (userModel ?? 'claude-opus-4-6');
+    : (userModel ?? (provider.type === 'claude' ? DEFAULT_CLAUDE_MODEL : undefined));
 
   // Start typing immediately, then refresh on interval
   await sendTyping(ctx.api, chatId);
@@ -538,14 +574,31 @@ async function handleMessage(ctx: Context, message: string, forceVoiceReply = fa
     const TOOL_NOTIFY_INTERVAL_MS = 30_000;
 
     const onProgress = (event: AgentProgressEvent) => {
+      const progressPayload = {
+        type: 'progress' as const,
+        chatId: chatIdStr,
+        description: event.description,
+        progressKind: event.type,
+        status: event.status,
+        kind: event.kind,
+        toolCallId: event.toolCallId,
+        locations: event.locations,
+        planEntries: event.planEntries,
+      };
       if (event.type === 'task_started') {
-        emitChatEvent({ type: 'progress', chatId: chatIdStr, description: event.description });
+        emitChatEvent(progressPayload);
         void ctx.reply(`🔄 ${event.description}`).catch(() => {});
       } else if (event.type === 'task_completed') {
-        emitChatEvent({ type: 'progress', chatId: chatIdStr, description: event.description });
-        void ctx.reply(`✓ ${event.description}`).catch(() => {});
+        emitChatEvent(progressPayload);
+        // Only notify Telegram for meaningful completions (sub-agent results),
+        // not generic "Tool result" from every individual tool call.
+        if (event.description !== 'Tool result') {
+          void ctx.reply(`✓ ${event.description}`).catch(() => {});
+        }
+      } else if (event.type === 'plan') {
+        emitChatEvent(progressPayload);
       } else if (event.type === 'tool_active') {
-        emitChatEvent({ type: 'progress', chatId: chatIdStr, description: event.description });
+        emitChatEvent(progressPayload);
         lastToolDesc = event.description;
         // Only send tool notifications to Telegram if streaming is off.
         // When streaming is active, the live text updates already show progress.
@@ -611,6 +664,8 @@ async function handleMessage(ctx: Context, message: string, forceVoiceReply = fa
       },
       MODEL_FALLBACK_CHAIN.length > 0 ? MODEL_FALLBACK_CHAIN : undefined,
       agentMcpAllowlist,
+      provider,
+      chatToolPolicyFor(provider),
     );
 
     clearTimeout(timeoutId);
@@ -659,7 +714,7 @@ async function handleMessage(ctx: Context, message: string, forceVoiceReply = fa
     const { text: responseText, files: fileMarkers } = extractFileMarkers(rawResponse);
 
     // Add cost footer
-    const costFooter = buildCostFooter(SHOW_COST_FOOTER, result.usage, effectiveModel);
+    const costFooter = buildCostFooter(SHOW_COST_FOOTER, result.usage, effectiveModel ?? provider.type);
 
     // Save conversation turn to memory (including full log).
     // Skip logging for synthetic messages like /respin to avoid self-referential growth.
@@ -860,7 +915,7 @@ export function createBot(): Bot {
   // Register callback for high-importance memory notifications.
   // When a memory with importance >= 0.8 is created, notify via Telegram
   // so the user can /pin it if it should be permanent.
-  if (ALLOWED_CHAT_ID) {
+  if (ALLOWED_CHAT_ID && MEMORY_NOTIFY) {
     setHighImportanceCallback((memoryId, summary, importance) => {
       const msg = `🧠 New memory #${memoryId} [${importance.toFixed(1)}]: ${summary.slice(0, 200)}\n\n/pin ${memoryId} to make permanent`;
       bot.api.sendMessage(ALLOWED_CHAT_ID, msg).catch(() => {});
@@ -875,6 +930,7 @@ export function createBot(): Bot {
     { command: 'respin', description: 'Reload recent context' },
     { command: 'voice', description: 'Toggle voice mode on/off' },
     { command: 'model', description: 'Switch model (opus/sonnet/haiku)' },
+    { command: 'provider', description: 'Show active provider' },
     { command: 'memory', description: 'View recent memories' },
     { command: 'forget', description: 'Clear session' },
     { command: 'wa', description: 'Recent WhatsApp messages' },
@@ -901,6 +957,7 @@ export function createBot(): Bot {
       '/respin — Reload recent context\n' +
       '/voice — Toggle voice mode on/off\n' +
       '/model — Switch model (opus/sonnet/haiku)\n' +
+      '/provider — Show active provider/model source\n' +
       '/memory — View recent memories\n' +
       '/forget — Clear session\n' +
       '/wa — WhatsApp messages\n' +
@@ -961,6 +1018,9 @@ export function createBot(): Bot {
             undefined,
             undefined,
             summaryAbort,
+            undefined,
+            undefined,
+            activeProvider(),
           );
           clearTimeout(summaryTimer);
 
@@ -1040,6 +1100,11 @@ export function createBot(): Bot {
   bot.command('model', async (ctx) => {
     if (await replyIfLocked(ctx)) return;
     const chatIdStr = ctx.chat!.id.toString();
+    const provider = activeProvider();
+    if (provider.type !== 'claude') {
+      await ctx.reply(`Active provider: ${getProviderDisplay(provider)}\n/model only applies to Claude. Use npm run provider:setup or the dashboard to change provider/model settings.`);
+      return;
+    }
     const arg = ctx.match?.trim().toLowerCase();
 
     if (!arg) {
@@ -1066,6 +1131,16 @@ export function createBot(): Bot {
 
     chatModelOverride.set(chatIdStr, modelId);
     await ctx.reply(`Model changed: ${arg} (${modelId})`);
+  });
+
+  // /provider — display active provider/model source only.
+  bot.command('provider', async (ctx) => {
+    if (await replyIfLocked(ctx)) return;
+    const provider = activeProvider();
+    const modelLine = provider.type === 'claude'
+      ? `Model: ${chatModelOverride.get(ctx.chat!.id.toString()) ?? agentDefaultModel ?? provider.model ?? DEFAULT_CLAUDE_MODEL}`
+      : 'Model: OpenCode/provider default config';
+    await ctx.reply(`Provider: ${getProviderDisplay(provider)}\n${modelLine}`);
   });
 
   // /memory — show recent memories for this chat
@@ -1197,9 +1272,16 @@ export function createBot(): Bot {
     const base = DASHBOARD_URL || `http://localhost:${DASHBOARD_PORT}`;
     const url = `${base}/?token=${DASHBOARD_TOKEN}&chatId=${chatIdStr}`;
 
-    const { InlineKeyboard } = await import('grammy');
-    const keyboard = new InlineKeyboard().url('Open Dashboard', url);
-    await ctx.reply('Dashboard', { reply_markup: keyboard });
+    if (canUseTelegramUrlButton(url)) {
+      const { InlineKeyboard } = await import('grammy');
+      const keyboard = new InlineKeyboard().url('Open Dashboard', url);
+      await ctx.reply('Dashboard', { reply_markup: keyboard });
+      return;
+    }
+
+    await ctx.reply(
+      `Dashboard is running locally:\n${url}\n\nTelegram cannot open localhost links as buttons. Open this on the machine running ClaudeClaw, or set DASHBOARD_URL to a public tunnel URL for phone access.`,
+    );
   });
 
   // /stop — interrupt the current agent query
@@ -1278,7 +1360,7 @@ export function createBot(): Bot {
   });
 
   // Text messages — and any slash commands not owned by this bot (skills, e.g. /todo /gmail)
-  const OWN_COMMANDS = new Set(['/start', '/help', '/newchat', '/respin', '/voice', '/model', '/memory', '/forget', '/pin', '/unpin', '/chatid', '/wa', '/slack', '/dashboard', '/stop', '/agents', '/delegate', '/lock', '/status']);
+  const OWN_COMMANDS = new Set(['/start', '/help', '/newchat', '/respin', '/voice', '/model', '/provider', '/memory', '/forget', '/pin', '/unpin', '/chatid', '/wa', '/slack', '/dashboard', '/stop', '/agents', '/delegate', '/lock', '/status']);
   bot.on('message:text', async (ctx) => {
     const text = ctx.message.text;
     const chatIdStr = ctx.chat!.id.toString();
@@ -1639,7 +1721,17 @@ async function processDashboardMessage(
     const fullMessage = dashParts.join('\n\n');
 
     const onProgress = (event: AgentProgressEvent) => {
-      emitChatEvent({ type: 'progress', chatId: chatIdStr, description: event.description });
+      emitChatEvent({
+        type: 'progress',
+        chatId: chatIdStr,
+        description: event.description,
+        progressKind: event.type,
+        status: event.status,
+        kind: event.kind,
+        toolCallId: event.toolCallId,
+        locations: event.locations,
+        planEntries: event.planEntries,
+      });
     };
 
     const abortCtrl = new AbortController();
@@ -1649,6 +1741,7 @@ async function processDashboardMessage(
       abortCtrl.abort();
     }, AGENT_TIMEOUT_MS);
 
+    const dashProvider = activeProvider();
     const result = await runAgent(
       fullMessage,
       sessionId,
@@ -1658,6 +1751,8 @@ async function processDashboardMessage(
       abortCtrl,
       undefined, // no streaming for dashboard
       agentMcpAllowlist,
+      dashProvider,
+      chatToolPolicyFor(dashProvider),
     );
 
     clearTimeout(dashTimeout);
@@ -1764,7 +1859,10 @@ async function processDashboardMessage(
   } catch (err) {
     setActiveAbort(chatIdStr, null);
     logger.error({ err }, 'Dashboard message processing error');
-    emitChatEvent({ type: 'error', chatId: chatIdStr, content: 'Something went wrong. Check the logs.' });
+    const userMessage = err instanceof AgentError
+      ? err.recovery.userMessage
+      : 'Something went wrong. Check the logs.';
+    emitChatEvent({ type: 'error', chatId: chatIdStr, content: userMessage });
   } finally {
     setProcessing(chatIdStr, false);
   }
