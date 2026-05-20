@@ -850,6 +850,7 @@ export function buildDashboardApp(botApi?: Api<RawApi>): Hono {
     const ids = ['main', ...listAgentIds().filter((id) => id !== 'main')];
     const agents = ids.map((id) => {
       try {
+        if (id === 'main') return { id: 'main', name: 'Main', description: 'DeLeonOS orchestrator. Routes commands to specialists, holds the leader\'s voice, keeps the system aligned.' };
         const cfg = loadAgentConfig(id);
         return { id, name: cfg.name || resolveAgentDisplayName(id), description: cfg.description || '' };
       } catch {
@@ -2148,7 +2149,6 @@ export function buildDashboardApp(botApi?: Api<RawApi>): Hono {
         ...agents,
       ];
     }
-
     return c.json({ agents: allAgents });
   });
 

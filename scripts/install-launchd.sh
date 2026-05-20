@@ -66,6 +66,7 @@ for plist in "$LAUNCHD_DIR"/com.claudeclaw.*.plist; do
   echo "Installing $label..."
   # Copy template and substitute placeholders with actual paths
   sed -e "s|__PROJECT_DIR__|$PROJECT_DIR|g" \
+      -e "s|__LOG_DIR__|$LOG_DIR|g" \
       -e "s|__HOME__|$HOME|g" \
       -e "s|__NODE_PATH__|$NODE_PATH|g" \
       -e "s|__NODE_BIN_DIR__|$NODE_BIN_DIR|g" \
