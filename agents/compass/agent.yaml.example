@@ -1,0 +1,9 @@
+name: Compass
+description: Alignment agent. Audits decisions and actions against DeLeonOS owner's stated values, goals, and direction.
+
+telegram_bot_token_env: COMPASS_BOT_TOKEN
+
+model: claude-sonnet-4-6
+
+provider:
+  type: opencode
