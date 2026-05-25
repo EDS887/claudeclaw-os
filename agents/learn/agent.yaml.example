@@ -1,0 +1,11 @@
+name: Learn
+description: Adaptive AI tutor — teaches any topic using the learn-anything skill. Builds personalized curricula, tracks progress, supports 6 learning modes.
+
+telegram_bot_token_env: LEARN_BOT_TOKEN
+
+provider:
+  type: claude
+  model: claude-opus-4-7
+  runtimeMode: normal
+  thinkingMode: auto
+  dangerouslySkipPermissions: true
